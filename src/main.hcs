@@ -1,1 +1,805 @@
+// crunch.hcs – TUI library inspired by Ratatui
+// Usage: from [crunch] require [Terminal, Buffer, Style, Color, Modifier, Paragraph, Block, List, Layout, Constraint, Rect, run_app, ...]
 
+from [std] require [io, string, math]
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Typy podstawowe
+// ──────────────────────────────────────────────────────────────────────────────
+
+enum Color
+    Reset
+    Black
+    Red
+    Green
+    Yellow
+    Blue
+    Magenta
+    Cyan
+    White
+    BrightBlack
+    BrightRed
+    BrightGreen
+    BrightYellow
+    BrightBlue
+    BrightMagenta
+    BrightCyan
+    BrightWhite
+end
+
+enum Modifier
+    Bold
+    Dim
+    Italic
+    Underline
+    Blink
+    Reverse
+    Hidden
+    Strikethrough
+end
+
+obj Style
+    fg: Color
+    bg: Color
+    modifiers: [Modifier]
+end
+
+fn style_default() : Style
+    let s = HCS_ALLOC_ZERO(_scope_arena, Style)
+    s.fg = Color.Reset
+    s.bg = Color.Reset
+    s.modifiers = []
+    return s
+end
+
+fn style_fg(s: Style, c: Color) : Style
+    s.fg = c
+    return s
+end
+
+fn style_bg(s: Style, c: Color) : Style
+    s.bg = c
+    return s
+end
+
+fn style_add_modifier(s: Style, m: Modifier) : Style
+    s.modifiers.push(m)
+    return s
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Bufor (grid)
+// ──────────────────────────────────────────────────────────────────────────────
+
+struct Cell
+    ch: str        // znak (może być wielobajtowy, ale dla uproszczenia ASCII)
+    style: Style
+end
+
+obj Buffer
+    width: u16
+    height: u16
+    cells: [Cell]
+end
+
+fn buffer_new(width: u16, height: u16) : Buffer
+    let buf = HCS_ALLOC_ZERO(_scope_arena, Buffer)
+    buf.width = width
+    buf.height = height
+    buf.cells = []
+    for _ in 0..width*height
+        let cell = HCS_ALLOC_ZERO(_scope_arena, Cell)
+        cell.ch = " "
+        cell.style = style_default()
+        buf.cells.push(cell)
+    end
+    return buf
+end
+
+fn buffer_clear(buf: Buffer)
+    for i in 0..buf.cells.len
+        let cell = buf.cells[i]
+        cell.ch = " "
+        cell.style = style_default()
+    end
+end
+
+fn buffer_set_char(buf: Buffer, x: u16, y: u16, ch: str, style: Style)
+    if x >= buf.width or y >= buf.height
+        return
+    end
+    let idx = y * buf.width + x
+    let cell = buf.cells[idx]
+    cell.ch = ch
+    cell.style = style
+end
+
+fn buffer_set_str(buf: Buffer, x: u16, y: u16, text: str, style: Style)
+    let mut cx = x
+    for i in 0..text.len
+        if cx >= buf.width
+            break
+        end
+        buffer_set_char(buf, cx, y, text.ptr[i] as char, style)
+        cx += 1
+    end
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Stylizacja → kody ANSI
+// ──────────────────────────────────────────────────────────────────────────────
+
+fn color_code(c: Color) : str
+    match c
+        Color.Reset        => return "0"
+        Color.Black        => return "30"
+        Color.Red          => return "31"
+        Color.Green        => return "32"
+        Color.Yellow       => return "33"
+        Color.Blue         => return "34"
+        Color.Magenta      => return "35"
+        Color.Cyan         => return "36"
+        Color.White        => return "37"
+        Color.BrightBlack  => return "90"
+        Color.BrightRed    => return "91"
+        Color.BrightGreen  => return "92"
+        Color.BrightYellow => return "93"
+        Color.BrightBlue   => return "94"
+        Color.BrightMagenta=> return "95"
+        Color.BrightCyan   => return "96"
+        Color.BrightWhite  => return "97"
+    end
+end
+
+fn modifier_code(m: Modifier) : str
+    match m
+        Modifier.Bold          => return "1"
+        Modifier.Dim           => return "2"
+        Modifier.Italic        => return "3"
+        Modifier.Underline     => return "4"
+        Modifier.Blink         => return "5"
+        Modifier.Reverse       => return "7"
+        Modifier.Hidden        => return "8"
+        Modifier.Strikethrough => return "9"
+    end
+end
+
+fn style_to_ansi(style: Style) : str
+    let mut codes = [] as [str]
+    if style.fg != Color.Reset
+        codes.push(color_code(style.fg))
+    end
+    if style.bg != Color.Reset
+        codes.push(color_code(style.bg) + ";?" ) // niepoprawne; lepiej oddzielnie
+        // W praktyce: background = fg + 10
+        let bg_code = (color_code(style.bg) as i32) + 10
+        codes.push(bg_code.to_string())
+    end
+    for m in style.modifiers
+        codes.push(modifier_code(m))
+    end
+    if codes.len == 0
+        return "\x1b[0m"
+    end
+    let seq = "\x1b[" + join(codes, ";") + "m"
+    return seq
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Terminal backend (low-level)
+// ──────────────────────────────────────────────────────────────────────────────
+
+extern
+    header [termios.h]
+    header [unistd.h]
+    header [sys/ioctl.h]
+    header [stdio.h]
+    header [signal.h]
+
+    type struct_termios
+    fn tcgetattr(i32 fd, ptr termios) : i32
+    fn tcsetattr(i32 fd, i32 actions, ptr termios) : i32
+    fn cfmakeraw(ptr termios)
+    fn write(i32 fd, ptr buf, u64 count) : i64
+    fn read(i32 fd, ptr buf, u64 count) : i64
+    fn ioctl(i32 fd, u64 request, ptr ws) : i32
+    struct winsize { ws_row: u16, ws_col: u16, ws_xpixel: u16, ws_ypixel: u16 }
+    const TIOCGWINSZ: u64 = 0x5413
+    fn signal(i32 sig, ptr handler) : ptr
+    const SIGWINCH: i32 = 28
+    fn getpid() : i32
+    fn kill(i32 pid, i32 sig) : i32
+end
+
+obj Terminal
+    raw_state: ptr     // opaque
+    alt_screen: bool
+    size: Size
+end
+
+fn terminal_enable_raw() : Terminal
+    direct
+        let term = HCS_ALLOC_ZERO(_scope_arena, Terminal)
+        let orig = HCS_ALLOC_N(_scope_arena, u8, 64)
+        if tcgetattr(0, orig) != 0
+            return nil
+        end
+        let raw = HCS_ALLOC_N(_scope_arena, u8, 64)
+        memcpy(raw, orig, 64)
+        cfmakeraw(raw)
+        if tcsetattr(0, 0, raw) != 0
+            return nil
+        end
+        term.raw_state = orig
+        // alternate screen
+        write(1, "\x1b[?1049h", 8) // enable alternate screen
+        term.alt_screen = true
+        // hide cursor
+        write(1, "\x1b[?25l", 6)
+        // get size
+        let ws: winsize
+        if ioctl(1, TIOCGWINSZ, &ws) == 0
+            term.size = Size { width: ws.ws_col, height: ws.ws_row }
+        else
+            term.size = Size { width: 80, height: 24 }
+        end
+        return term
+    end
+end
+
+fn terminal_disable(term: Terminal)
+    direct
+        if term.alt_screen
+            write(1, "\x1b[?1049l", 8) // disable alternate screen
+        end
+        write(1, "\x1b[?25h", 6) // show cursor
+        tcsetattr(0, 0, term.raw_state)
+    end
+end
+
+fn terminal_get_size(term: Terminal) : Size
+    direct
+        let ws: winsize
+        if ioctl(1, TIOCGWINSZ, &ws) == 0
+            term.size = Size { width: ws.ws_col, height: ws.ws_row }
+        end
+        return term.size
+    end
+end
+
+fn terminal_draw(term: Terminal, buf: Buffer)
+    direct
+        let mut out = "" as str
+        // przejście na początek
+        out += "\x1b[1;1H"
+        let mut last_style = style_default()
+        for y in 0..buf.height
+            for x in 0..buf.width
+                let idx = y * buf.width + x
+                let cell = buf.cells[idx]
+                if not styles_equal(cell.style, last_style)
+                    out += style_to_ansi(cell.style)
+                    last_style = cell.style
+                end
+                out += cell.ch
+            end
+            out += "\n"
+        end
+        out += style_to_ansi(style_default())
+        write(1, out.ptr, out.len)
+        fflush(stdout)
+    end
+end
+
+fn styles_equal(a: Style, b: Style) : bool
+    if a.fg != b.fg or a.bg != b.bg
+        return false
+    end
+    if a.modifiers.len != b.modifiers.len
+        return false
+    end
+    for i in 0..a.modifiers.len
+        if a.modifiers[i] != b.modifiers[i]
+            return false
+        end
+    end
+    return true
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Zdarzenia
+// ──────────────────────────────────────────────────────────────────────────────
+
+enum Key
+    Char(u8)
+    Enter
+    Tab
+    Escape
+    Backspace
+    Delete
+    Home
+    End
+    PageUp
+    PageDown
+    Up
+    Down
+    Left
+    Right
+    CtrlA
+    CtrlB
+    CtrlC
+    CtrlD
+    CtrlE
+    CtrlF
+    CtrlH
+    CtrlK
+    CtrlL
+    CtrlN
+    CtrlP
+    CtrlU
+    CtrlW
+    Alt(u8)
+    Unknown
+end
+
+enum MouseEvent
+    Press(u8, u16, u16)
+    Release(u8, u16, u16)
+    Move(u16, u16)
+    WheelUp(u16, u16)
+    WheelDown(u16, u16)
+end
+
+enum Event
+    Key(Key)
+    Mouse(MouseEvent)
+    Resize(u16, u16)
+    Quit
+    Custom(str)
+end
+
+fn read_event() : Event
+    direct
+        let mut buf = HCS_ALLOC_N(_scope_arena, u8, 8)
+        let n = read(0, buf, 1)
+        if n <= 0
+            return Event.Quit
+        end
+        let c = buf[0]
+        if c == 27
+            let n2 = read(0, buf+1, 1)
+            if n2 > 0
+                // parse escape sequence
+                let (key, _) = parse_escape(buf, 1)
+                return Event.Key(key)
+            end
+            return Event.Key(Key.Escape)
+        else if c == 10
+            return Event.Key(Key.Enter)
+        else if c == 9
+            return Event.Key(Key.Tab)
+        else if c == 127
+            return Event.Key(Key.Backspace)
+        else if c >= 1 and c <= 26
+            let key = match c
+                1 => Key.CtrlA
+                2 => Key.CtrlB
+                3 => Key.CtrlC
+                4 => Key.CtrlD
+                5 => Key.CtrlE
+                6 => Key.CtrlF
+                8 => Key.CtrlH
+                11 => Key.CtrlK
+                12 => Key.CtrlL
+                14 => Key.CtrlN
+                16 => Key.CtrlP
+                21 => Key.CtrlU
+                23 => Key.CtrlW
+                _ => Key.Unknown
+            end
+            return Event.Key(key)
+        else
+            return Event.Key(Key.Char(c))
+        end
+    end
+end
+
+fn parse_escape(buf: [u8], pos: i64) : (Key, i64)
+    if pos >= buf.len
+        return (Key.Escape, 1)
+    end
+    let c = buf[pos]
+    if c == 91
+        if pos+1 >= buf.len
+            return (Key.Escape, 1)
+        end
+        let c2 = buf[pos+1]
+        if c2 == 65
+            return (Key.Up, 2)
+        else if c2 == 66
+            return (Key.Down, 2)
+        else if c2 == 67
+            return (Key.Right, 2)
+        else if c2 == 68
+            return (Key.Left, 2)
+        else if c2 == 72
+            return (Key.Home, 2)
+        else if c2 == 70
+            return (Key.End, 2)
+        else if c2 == 51 and pos+2 < buf.len and buf[pos+2] == 126
+            return (Key.Delete, 3)
+        else if c2 == 53 and pos+2 < buf.len and buf[pos+2] == 126
+            return (Key.PageUp, 3)
+        else if c2 == 54 and pos+2 < buf.len and buf[pos+2] == 126
+            return (Key.PageDown, 3)
+        end
+    end
+    return (Key.Unknown, 1)
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Widgety
+// ──────────────────────────────────────────────────────────────────────────────
+
+obj Rect
+    x: u16
+    y: u16
+    width: u16
+    height: u16
+end
+
+type Widget = obj {
+    render: fn(widget: Widget, buf: Buffer, area: Rect)
+}
+
+// ---------- Paragraph ----------
+obj ParagraphData
+    text: str
+    wrap: bool
+end
+
+fn paragraph_new(text: str) : Widget
+    let w = HCS_ALLOC_ZERO(_scope_arena, Widget)
+    let data = HCS_ALLOC_ZERO(_scope_arena, ParagraphData)
+    data.text = text
+    data.wrap = true
+    w.data = data
+    w.render = paragraph_render
+    return w
+end
+
+fn paragraph_set_wrap(w: Widget, wrap: bool)
+    let data = w.data as ParagraphData
+    data.wrap = wrap
+end
+
+fn paragraph_render(w: Widget, buf: Buffer, area: Rect)
+    let data = w.data as ParagraphData
+    let text = data.text
+    let mut y = area.y
+    let mut x = area.x
+    let mut pos = 0
+    let style = style_default()
+    while pos < text.len and y < area.y + area.height
+        let line = if data.wrap
+            // proste zawijanie do width
+            let remain = area.width
+            let line_end = pos + remain
+            if line_end > text.len then line_end = text.len end
+            text.ptr[pos..line_end] as str
+        else
+            // bez zawijania – cała reszta
+            text.ptr[pos..] as str
+        end
+        buffer_set_str(buf, x, y, line, style)
+        y += 1
+        pos += line.len
+    end
+end
+
+// ---------- Block ----------
+obj BlockData
+    title: str
+    borders: bool
+    border_style: Style
+end
+
+fn block_new(title: str) : Widget
+    let w = HCS_ALLOC_ZERO(_scope_arena, Widget)
+    let data = HCS_ALLOC_ZERO(_scope_arena, BlockData)
+    data.title = title
+    data.borders = true
+    data.border_style = style_default()
+    w.data = data
+    w.render = block_render
+    return w
+end
+
+fn block_render(w: Widget, buf: Buffer, area: Rect)
+    let data = w.data as BlockData
+    if area.width < 2 or area.height < 2
+        return
+    end
+    // górna krawędź
+    buffer_set_char(buf, area.x, area.y, "┌", data.border_style)
+    for i in 1..area.width-1
+        buffer_set_char(buf, area.x + i, area.y, "─", data.border_style)
+    end
+    buffer_set_char(buf, area.x + area.width - 1, area.y, "┐", data.border_style)
+    // dolna
+    buffer_set_char(buf, area.x, area.y + area.height - 1, "└", data.border_style)
+    for i in 1..area.width-1
+        buffer_set_char(buf, area.x + i, area.y + area.height - 1, "─", data.border_style)
+    end
+    buffer_set_char(buf, area.x + area.width - 1, area.y + area.height - 1, "┘", data.border_style)
+    // lewa i prawa
+    for i in 1..area.height-1
+        buffer_set_char(buf, area.x, area.y + i, "│", data.border_style)
+        buffer_set_char(buf, area.x + area.width - 1, area.y + i, "│", data.border_style)
+    end
+    // tytuł
+    if data.title.len > 0
+        let title_x = area.x + 2
+        if title_x + data.title.len < area.x + area.width - 1
+            buffer_set_str(buf, title_x, area.y, data.title, data.border_style)
+        end
+    end
+end
+
+// ---------- List ----------
+obj ListData
+    items: [str]
+    selected: i32
+    focused: bool
+end
+
+fn list_new(items: [str]) : Widget
+    let w = HCS_ALLOC_ZERO(_scope_arena, Widget)
+    let data = HCS_ALLOC_ZERO(_scope_arena, ListData)
+    data.items = items
+    data.selected = 0
+    data.focused = false
+    w.data = data
+    w.render = list_render
+    return w
+end
+
+fn list_update(w: Widget, ev: Event) : (Widget, Event)
+    let data = w.data as ListData
+    match ev
+        Event.Key(Key.Up) =>
+            if data.selected > 0
+                data.selected -= 1
+            end
+        Event.Key(Key.Down) =>
+            if data.selected + 1 < data.items.len
+                data.selected += 1
+            end
+        Event.Key(Key.Enter) =>
+            if data.focused
+                return (w, Event.Custom("selected:" + data.items[data.selected]))
+            end
+        Event.Key(Key.Tab) =>
+            data.focused = not data.focused
+        _ => {}
+    end
+    return (w, nil)
+end
+
+fn list_render(w: Widget, buf: Buffer, area: Rect)
+    let data = w.data as ListData
+    let mut y = area.y
+    let mut i = 0
+    while y < area.y + area.height and i < data.items.len
+        let item = data.items[i]
+        let style = if i == data.selected
+            style_fg(style_bg(style_default(), Color.Blue), Color.White)
+        else
+            style_default()
+        end
+        if i == data.selected and data.focused
+            // dodatkowy wskaźnik
+            buffer_set_str(buf, area.x, y, "> " + item, style)
+        else
+            buffer_set_str(buf, area.x, y, "  " + item, style)
+        end
+        y += 1
+        i += 1
+    end
+end
+
+// ---------- Gauge ----------
+obj GaugeData
+    percent: f64
+    label: str
+end
+
+fn gauge_new() : Widget
+    let w = HCS_ALLOC_ZERO(_scope_arena, Widget)
+    let data = HCS_ALLOC_ZERO(_scope_arena, GaugeData)
+    data.percent = 0.0
+    data.label = ""
+    w.data = data
+    w.render = gauge_render
+    return w
+end
+
+fn gauge_set_percent(w: Widget, percent: f64)
+    let data = w.data as GaugeData
+    data.percent = max(0.0, min(1.0, percent))
+end
+
+fn gauge_set_label(w: Widget, label: str)
+    let data = w.data as GaugeData
+    data.label = label
+end
+
+fn gauge_render(w: Widget, buf: Buffer, area: Rect)
+    let data = w.data as GaugeData
+    let width = area.width
+    let filled = (data.percent * width as f64) as u16
+    let style = style_fg(style_default(), Color.Green)
+    for x in 0..width
+        let ch = if x < filled { "█" } else { "░" }
+        buffer_set_char(buf, area.x + x, area.y, ch, style)
+    end
+    if data.label.len > 0
+        let label_x = area.x + (width - data.label.len) / 2
+        buffer_set_str(buf, label_x, area.y, data.label, style)
+    end
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Layout
+// ──────────────────────────────────────────────────────────────────────────────
+
+enum Constraint
+    Length(u16)    // absolutna długość
+    Percentage(u16) // procent z dostępnego miejsca
+    Min(u16)       // minimalna długość
+    Max(u16)       // maksymalna
+end
+
+fn layout_split(area: Rect, direction: str, constraints: [Constraint]) : [Rect]
+    // direction: "horizontal" or "vertical"
+    let total = if direction == "horizontal" { area.width } else { area.height }
+    let mut result = [] as [Rect]
+    let mut used = 0
+    let mut flex = 0
+    // pierwszy przebieg: oblicz sumę wartości stałych
+    for c in constraints
+        match c
+            Constraint.Length(v) => used += v
+            Constraint.Percentage(p) => flex += p
+            Constraint.Min(v) => used += v
+            Constraint.Max(v) => // to do after
+        end
+    end
+    let remaining = total - used
+    let mut flex_total = flex
+    let mut sizes = [] as [u16]
+    for c in constraints
+        let size = match c
+            Constraint.Length(v) => v
+            Constraint.Percentage(p) => (remaining * p / 100) as u16
+            Constraint.Min(v) => v
+            Constraint.Max(v) => v
+        end
+        sizes.push(size)
+    end
+    // drugi przebieg: dostosuj do min/max
+    let mut pos = 0
+    for i in 0..constraints.len
+        let mut sz = sizes[i]
+        match constraints[i]
+            Constraint.Min(min) =>
+                if sz < min then sz = min end
+            Constraint.Max(max) =>
+                if sz > max then sz = max end
+            _ => {}
+        end
+        if direction == "horizontal"
+            let rect = Rect { x: area.x + pos, y: area.y, width: sz, height: area.height }
+            result.push(rect)
+        else
+            let rect = Rect { x: area.x, y: area.y + pos, width: area.width, height: sz }
+            result.push(rect)
+        end
+        pos += sz
+    end
+    return result
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Aplikacja
+// ──────────────────────────────────────────────────────────────────────────────
+
+obj App
+    term: Terminal
+    buffer: Buffer
+    widgets: [Widget]
+    running: bool
+    // user-defined update function
+    update: fn(app: App, ev: Event) -> App
+end
+
+fn app_new(update_fn: fn(app: App, ev: Event) -> App) : App
+    let term = terminal_enable_raw()
+    if term == nil
+        eprintln("Failed to init terminal")
+        return nil
+    end
+    let size = terminal_get_size(term)
+    let buf = buffer_new(size.width, size.height)
+    let app = HCS_ALLOC_ZERO(_scope_arena, App)
+    app.term = term
+    app.buffer = buf
+    app.widgets = []
+    app.running = true
+    app.update = update_fn
+    return app
+end
+
+fn app_add_widget(app: App, w: Widget)
+    app.widgets.push(w)
+end
+
+fn app_run(app: App) : i32
+    while app.running
+        // resize event
+        let new_size = terminal_get_size(app.term)
+        if new_size.width != app.buffer.width or new_size.height != app.buffer.height
+            app.buffer = buffer_new(new_size.width, new_size.height)
+            app.update(app, Event.Resize(new_size.width, new_size.height))
+        end
+        // read events
+        let ev = read_event()
+        if ev == Event.Quit
+            app.running = false
+            break
+        end
+        // update app
+        let new_app = app.update(app, ev)
+        if new_app != app
+            app = new_app
+        end
+        // draw
+        buffer_clear(app.buffer)
+        for w in app.widgets
+            // widgety mogą być umieszczane w całym obszarze, ale upraszczamy – rysujemy na całym buforze
+            // można też przekazać rect całego ekranu
+            let area = Rect { x: 0, y: 0, width: app.buffer.width, height: app.buffer.height }
+            w.render(w, app.buffer, area)
+        end
+        terminal_draw(app.term, app.buffer)
+    end
+    terminal_disable(app.term)
+    return 0
+end
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Przykład użycia (komentarz)
+// ──────────────────────────────────────────────────────────────────────────────
+/*
+from [crunch] require [app_new, app_add_widget, app_run, paragraph_new, block_new, list_new, gauge_new, layout_split, Constraint]
+
+fn update(app: App, ev: Event) -> App
+    // prosta aktualizacja – można modyfikować widgety
+    return app
+end
+
+fn main() : i32
+    let app = app_new(update)
+    let para = paragraph_new("Hello, Crunch!\nThis is a paragraph.")
+    let block = block_new("Title")
+    let list = list_new(["Item 1", "Item 2", "Item 3"])
+    let gauge = gauge_new()
+    gauge_set_percent(gauge, 0.75)
+    gauge_set_label(gauge, "75%")
+    app_add_widget(app, block)
+    app_add_widget(app, para)
+    app_add_widget(app, list)
+    app_add_widget(app, gauge)
+    return app_run(app)
+end
+*/
